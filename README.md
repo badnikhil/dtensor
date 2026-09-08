@@ -32,17 +32,28 @@ Skeleton. What exists today:
 
 ## Build
 
-```sh
-nice -19 ionice -c3 dub build --compiler=ldc2 -j2
-nice -19 ionice -c3 dub test --compiler=ldc2 -j2      # needs a CUDA device
-```
-
-The host-only logic (strides, shapes, reshape/transpose) is additionally testable with
-no GPU present:
+dcompute's `dcompute.std` package `static assert`s unless the compiler is invoked with
+`-mdcompute-targets`, and dub does not push a dependent's `dflags` down into a dependency —
+so the flag has to reach *every* package via `DFLAGS`, and the build type has to be given
+explicitly (setting `DFLAGS` otherwise makes dub switch to its `$DFLAGS` build type and drop
+`-unittest`):
 
 ```sh
-nice -19 ionice -c3 dub run :hosttest --compiler=ldc2 -j2
+export DC=~/dlang/ldc-1.43.0/bin/ldc2
+
+DFLAGS="-mdcompute-targets=cuda-800" nice -19 ionice -c3 \
+    dub build --build=release --compiler=$DC
+
+DFLAGS="-mdcompute-targets=cuda-800" nice -19 ionice -c3 \
+    dub test --build=unittest --compiler=$DC
 ```
+
+sm_80 rather than the RTX 2050's native sm_86: LDC's valid-target list rejects `cuda-860`,
+and the driver JITs 8.0 PTX up to 8.6.
+
+The tests allocate device memory and copy host↔device, so they need a CUDA driver and a
+device — but they compile and launch no kernels, so they do not depend on the embedded-PTX
+`launch!` path. The pure shape/stride unittest needs no GPU at all.
 
 ## Conventions
 
