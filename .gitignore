@@ -1,0 +1,24 @@
+# dub
+.dub/
+dub.selections.json
+docs/
+__dummy.html
+docs.json
+
+# build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.lst
+*.ptx
+*.spv
+*-test-*
+dtensor
+dtensor-*
+
+# agent scratch — local only, never committed
+agent-docs/
