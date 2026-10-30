@@ -9,6 +9,8 @@
 module dtensor.tensor;
 
 import dcompute.driver.cuda;
+public import dcompute.std.ndview : NdView;
+import ldc.dcompute : GlobalPointer;
 
 import mir.ndslice.slice : Slice, SliceKind, Universal;
 
@@ -148,6 +150,12 @@ if (N >= 1)
         return s;
     }
 
+    /// Returns an `NdView!(T, N)` pointing to this tensor's device memory
+    /// with the same shape and strides, suitable for passing to a `@kernel`.
+    NdView!(T, N) deviceView() const pure nothrow @nogc
+    {
+        return NdView!(T, N)(GlobalPointer!T(cast(T*) store.raw), shape, strides);
+    }
 }
 
 /// Uploads a host ndslice into a fresh C-contiguous `Tensor`, reading the
@@ -267,4 +275,20 @@ unittest
         pragma(msg, "dtensor: this dcompute has no Buffer destructor, "
             ~ "so the churn test is skipped and Tensor leaks device memory.");
     }
+}
+
+unittest
+{
+    auto t = Tensor!(float, 2)([3LU, 4LU]);
+    auto v = t.deviceView();
+    static assert(is(typeof(v) == NdView!(float, 2)));
+    assert(cast(size_t) v.ptr.ptr == t.store.raw);
+    assert(v.shape == [3LU, 4LU]);
+    assert(v.strides == [4LU, 1LU]);
+
+    auto tr = t.transpose();
+    auto vtr = tr.deviceView();
+    assert(cast(size_t) vtr.ptr.ptr == t.store.raw);
+    assert(vtr.shape == [4LU, 3LU]);
+    assert(vtr.strides == [1LU, 4LU]);
 }
