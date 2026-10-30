@@ -292,3 +292,34 @@ unittest
     assert(vtr.shape == [4LU, 3LU]);
     assert(vtr.strides == [1LU, 4LU]);
 }
+
+unittest
+{
+    import dtensor.testkernels : tensorScale2D;
+
+    auto src = iota(3, 4).as!float.slice;
+    auto x = fromNdslice(src);
+    auto y = Tensor!(float, 2)([3LU, 4LU]);
+
+    enum uint block = 64;
+    immutable uint grid = cast(uint)((x.length + block - 1) / block);
+
+    launch!tensorScale2D([grid, 1, 1], [block, 1, 1], y.deviceView(), x.deviceView(), 2.5f);
+
+    auto res = y.toNdslice();
+    foreach (i; 0 .. 3)
+        foreach (j; 0 .. 4)
+            assert(res[i, j] == src[i, j] * 2.5f);
+
+    // Also verify over a transposed view:
+    auto xt = x.transpose();
+    auto yt = Tensor!(float, 2)([4LU, 3LU]);
+    immutable uint gridT = cast(uint)((xt.length + block - 1) / block);
+
+    launch!tensorScale2D([gridT, 1, 1], [block, 1, 1], yt.deviceView(), xt.deviceView(), 3.0f);
+
+    auto resT = yt.toNdslice();
+    foreach (i; 0 .. 4)
+        foreach (j; 0 .. 3)
+            assert(resT[i, j] == src[j, i] * 3.0f);
+}

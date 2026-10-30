@@ -6,6 +6,8 @@
     "copyright": "Copyright © 2026, Nikhil Jatt",
 
     "targetType": "library",
+    "versions": ["DComputeCUDA_800"],
+    "sourceFiles": ["../dcompute/source/dcompute/std/ndview.d"],
 
     "dependencies": {
         "dcompute": { "path": "../dcompute" },
