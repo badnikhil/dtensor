@@ -1,26 +1,48 @@
 {
     "name": "dtensor",
     "description": "GPU-accelerated tensor programming model for D, built on dcompute",
-    "authors": ["Nikhil Jatt"],
+    "authors": [
+        "Nikhil Jatt"
+    ],
     "license": "BSL-1.0",
     "copyright": "Copyright © 2026, Nikhil Jatt",
-
     "targetType": "library",
-    "versions": ["DComputeCUDA_800"],
-    "sourceFiles": ["../dcompute/source/dcompute/std/ndview.d"],
-
     "dependencies": {
-        "dcompute": { "path": "../dcompute" },
+        "dcompute": {
+            "path": "../dcompute"
+        },
         "mir-algorithm": "~>3.22.4"
     },
-
     "toolchainRequirements": {
         "dmd": "no",
         "gdc": "no",
         "ldc": ">=1.43.0"
     },
-
     "configurations": [
-        { "name": "library" }
+        {
+            "name": "library",
+            "targetType": "library"
+        },
+        {
+            "name": "unittest",
+            "targetType": "library",
+            "sourcePaths": [
+                "source",
+                "tests"
+            ],
+            "importPaths": [
+                "tests"
+            ],
+            "versions": [
+                "DComputeCUDA_800"
+            ],
+            "dflags-ldc": [
+                "-mdcompute-targets=cuda-800",
+                "-linkonce-templates"
+            ],
+            "subConfigurations": {
+                "dcompute": "library-cuda"
+            }
+        }
     ]
 }
