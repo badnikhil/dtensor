@@ -21,11 +21,24 @@
     "configurations": [
         {
             "name": "library",
-            "targetType": "library"
+            "targetType": "library",
+            "versions": [
+                "DComputeCUDA_800"
+            ],
+            "dflags-ldc": [
+                "-mdcompute-targets=cuda-800",
+                "-linkonce-templates"
+            ],
+            "subConfigurations": {
+                "dcompute": "library-cuda"
+            }
         },
         {
             "name": "unittest",
             "targetType": "library",
+            "buildRequirements": [
+                "allowWarnings"
+            ],
             "sourcePaths": [
                 "source",
                 "tests"

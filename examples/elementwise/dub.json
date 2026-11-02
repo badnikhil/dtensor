@@ -1,0 +1,10 @@
+{
+    "name": "elementwise-example",
+    "description": "Example demonstrating broadcast addition using dtensor",
+    "targetType": "executable",
+    "dependencies": {
+        "dtensor": {
+            "path": "../.."
+        }
+    }
+}
