@@ -43,6 +43,101 @@ size_t elementCount(size_t N)(const size_t[N] shape) @safe pure nothrow @nogc
     assert(elementCount([2LU, 3LU, 4LU]) == 24);
 }
 
+/// Thrown when tensor shapes are incompatible for broadcasting.
+class ShapeMismatchException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/// Computes the broadcast output shape for two tensor shapes according to NumPy rules.
+/// Shapes are right-aligned. Dimensions are compatible if they are equal or one of them is 1.
+/// Throws `ShapeMismatchException` if shapes cannot be broadcast.
+size_t[(Na >= Nb ? Na : Nb)] broadcastShapes(size_t Na, size_t Nb)(const size_t[Na] shapeA, const size_t[Nb] shapeB)
+{
+    enum size_t N = Na >= Nb ? Na : Nb;
+    size_t[N] outShape;
+    foreach (k; 0 .. N)
+    {
+        size_t dimA = (k < N - Na) ? 1 : shapeA[k - (N - Na)];
+        size_t dimB = (k < N - Nb) ? 1 : shapeB[k - (N - Nb)];
+
+        if (dimA == dimB)
+            outShape[k] = dimA;
+        else if (dimA == 1)
+            outShape[k] = dimB;
+        else if (dimB == 1)
+            outShape[k] = dimA;
+        else
+        {
+            import std.format : format;
+            throw new ShapeMismatchException(
+                format("Cannot broadcast shapes %s and %s: incompatible dimensions %s and %s at axis %s",
+                    shapeA, shapeB, dimA, dimB, k));
+        }
+    }
+    return outShape;
+}
+
+/// Computes broadcast strides of rank `N` for a tensor of rank `Na` (`Na <= N`).
+/// Size-1 dimensions and prepended dimensions use stride 0 so each index aliases the same element.
+size_t[N] broadcastStrides(size_t Na, size_t N)(const size_t[Na] shapeA, const size_t[Na] stridesA) @safe pure nothrow @nogc
+{
+    size_t[N] outStrides;
+    foreach (k; 0 .. N)
+    {
+        if (k < N - Na)
+            outStrides[k] = 0;
+        else
+        {
+            size_t orig = k - (N - Na);
+            if (shapeA[orig] == 1)
+                outStrides[k] = 0;
+            else
+                outStrides[k] = stridesA[orig];
+        }
+    }
+    return outStrides;
+}
+
+/// Helper template detecting whether `X` is an instantiation of `Tensor`.
+template isTensor(X)
+{
+    static if (is(X == Tensor!(U, M), U, size_t M))
+        enum isTensor = true;
+    else
+        enum isTensor = false;
+}
+
+/// Returns an `NdView!(T, N)` with broadcast strides matching `outShape`.
+NdView!(T, N) broadcastView(size_t N, T, size_t Na)(auto ref const Tensor!(T, Na) t, const size_t[N] outShape) pure nothrow @nogc
+{
+    size_t[N] bStrides = broadcastStrides!(Na, N)(t.shape, t.strides);
+    return NdView!(T, N)(GlobalPointer!T(cast(T*) t.store.raw), outShape, bStrides);
+}
+
+@safe pure unittest
+{
+    assert(broadcastShapes([2LU, 3LU], [2LU, 3LU]) == [2LU, 3LU]);
+    assert(broadcastShapes([3LU, 1LU], [1LU, 4LU]) == [3LU, 4LU]);
+    assert(broadcastShapes([2LU, 3LU], [3LU]) == [2LU, 3LU]);
+    assert(broadcastShapes([3LU], [2LU, 3LU]) == [2LU, 3LU]);
+    assert(broadcastShapes([2LU, 1LU, 4LU], [3LU, 1LU]) == [2LU, 3LU, 4LU]);
+
+    assert(broadcastStrides!(2, 2)([3LU, 1LU], [1LU, 1LU]) == [1LU, 0LU]);
+    assert(broadcastStrides!(2, 2)([1LU, 4LU], [4LU, 1LU]) == [0LU, 1LU]);
+    assert(broadcastStrides!(1, 2)([3LU], [1LU]) == [0LU, 1LU]);
+}
+
+unittest
+{
+    import std.exception : assertThrown;
+    assertThrown!ShapeMismatchException(broadcastShapes([2LU, 3LU], [2LU, 4LU]));
+    assertThrown!ShapeMismatchException(broadcastShapes([2LU, 3LU], [4LU]));
+}
+
 /// An N-dimensional tensor whose elements live in device memory.
 struct Tensor(T, size_t N)
 if (N >= 1)
@@ -156,6 +251,95 @@ if (N >= 1)
     {
         return NdView!(T, N)(GlobalPointer!T(cast(T*) store.raw), shape, strides);
     }
+
+    /// Elementwise binary operations between two tensors (+, -, *, /) with NumPy broadcasting.
+    Tensor!(T, (N >= Nb ? N : Nb)) opBinary(string op, size_t Nb)(auto ref const Tensor!(T, Nb) rhs) const
+    if (op == "+" || op == "-" || op == "*" || op == "/")
+    {
+        import dtensor.testkernels : elementwiseOp;
+
+        enum size_t OutRank = N >= Nb ? N : Nb;
+        const size_t[OutRank] outShape = broadcastShapes!(N, Nb)(this.shape, rhs.shape);
+        auto res = Tensor!(T, OutRank)(outShape);
+
+        auto vA = broadcastView!OutRank(this, outShape);
+        auto vB = broadcastView!OutRank(rhs, outShape);
+
+        enum uint block = 256;
+        uint grid = cast(uint)((res.length + block - 1) / block);
+        if (grid == 0) grid = 1;
+
+        alias K = elementwiseOp!(op, T, OutRank, NdView!(T, OutRank), NdView!(T, OutRank));
+        launch!K([grid, 1, 1], [block, 1, 1], res.deviceView(), vA, vB);
+
+        return res;
+    }
+
+    /// Elementwise binary operations between tensor and scalar (+, -, *, /).
+    Tensor!(T, N) opBinary(string op, S)(S rhs) const
+    if ((op == "+" || op == "-" || op == "*" || op == "/") &&
+        !isTensor!S &&
+        (is(S : T) || is(typeof(cast(T) rhs))))
+    {
+        import dtensor.testkernels : elementwiseOp;
+
+        auto res = Tensor!(T, N)(this.shape);
+        auto vA = this.deviceView();
+
+        enum uint block = 256;
+        uint grid = cast(uint)((res.length + block - 1) / block);
+        if (grid == 0) grid = 1;
+
+        alias K = elementwiseOp!(op, T, N, NdView!(T, N), T);
+        launch!K([grid, 1, 1], [block, 1, 1], res.deviceView(), vA, cast(T) rhs);
+
+        return res;
+    }
+
+    /// Elementwise binary operations between scalar and tensor (+, -, *, /).
+    Tensor!(T, N) opBinaryRight(string op, S)(S lhs) const
+    if ((op == "+" || op == "-" || op == "*" || op == "/") &&
+        !isTensor!S &&
+        (is(S : T) || is(typeof(cast(T) lhs))))
+    {
+        import dtensor.testkernels : elementwiseOp;
+
+        auto res = Tensor!(T, N)(this.shape);
+        auto vB = this.deviceView();
+
+        enum uint block = 256;
+        uint grid = cast(uint)((res.length + block - 1) / block);
+        if (grid == 0) grid = 1;
+
+        alias K = elementwiseOp!(op, T, N, T, NdView!(T, N));
+        launch!K([grid, 1, 1], [block, 1, 1], res.deviceView(), cast(T) lhs, vB);
+
+        return res;
+    }
+}
+
+/// Elementwise addition: `a + b`.
+auto add(A, B)(auto ref A a, auto ref B b)
+{
+    return a + b;
+}
+
+/// Elementwise subtraction: `a - b`.
+auto sub(A, B)(auto ref A a, auto ref B b)
+{
+    return a - b;
+}
+
+/// Elementwise multiplication: `a * b`.
+auto mul(A, B)(auto ref A a, auto ref B b)
+{
+    return a * b;
+}
+
+/// Elementwise division: `a / b`.
+auto div(A, B)(auto ref A a, auto ref B b)
+{
+    return a / b;
 }
 
 /// Uploads a host ndslice into a fresh C-contiguous `Tensor`, reading the
@@ -322,4 +506,231 @@ unittest
     foreach (i; 0 .. 4)
         foreach (j; 0 .. 3)
             assert(resT[i, j] == src[j, i] * 3.0f);
+}
+
+unittest
+{
+    // Same-shape elementwise ops between two tensors
+    auto sa = iota(2, 3).as!float.slice;
+    auto sb = iota([2, 3], 10).as!float.slice;
+
+    auto a = fromNdslice(sa);
+    auto b = fromNdslice(sb);
+
+    // Addition
+    auto cAdd = a + b;
+    static assert(is(typeof(cAdd) == Tensor!(float, 2)));
+    assert(cAdd.shape == [2LU, 3LU]);
+    auto resAdd = cAdd.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resAdd[i, j] == sa[i, j] + sb[i, j]);
+
+    // Subtraction
+    auto cSub = a - b;
+    auto resSub = cSub.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resSub[i, j] == sa[i, j] - sb[i, j]);
+
+    // Multiplication
+    auto cMul = a * b;
+    auto resMul = cMul.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resMul[i, j] == sa[i, j] * sb[i, j]);
+
+    // Division
+    auto cDiv = b / (a + 1.0f);
+    auto resDiv = cDiv.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resDiv[i, j] == sb[i, j] / (sa[i, j] + 1.0f));
+
+    // Also check function API: add, sub, mul, div
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+        {
+            assert(add(a, b).toNdslice()[i, j] == resAdd[i, j]);
+            assert(sub(a, b).toNdslice()[i, j] == resSub[i, j]);
+            assert(mul(a, b).toNdslice()[i, j] == resMul[i, j]);
+        }
+}
+
+unittest
+{
+    // Scalar operations
+    auto sa = iota(2, 3).as!float.slice;
+    auto a = fromNdslice(sa);
+
+    // Tensor + scalar
+    auto cAdd = a + 2.5f;
+    auto resAdd = cAdd.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resAdd[i, j] == sa[i, j] + 2.5f);
+
+    // Tensor - scalar
+    auto cSub = a - 1.0f;
+    auto resSub = cSub.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resSub[i, j] == sa[i, j] - 1.0f);
+
+    // Tensor * scalar
+    auto cMul = a * 3.0f;
+    auto resMul = cMul.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resMul[i, j] == sa[i, j] * 3.0f);
+
+    // Tensor / scalar
+    auto cDiv = a / 2.0f;
+    auto resDiv = cDiv.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resDiv[i, j] == sa[i, j] / 2.0f);
+
+    // Scalar - tensor
+    auto cRsub = 10.0f - a;
+    auto resRsub = cRsub.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resRsub[i, j] == 10.0f - sa[i, j]);
+
+    // Scalar / tensor
+    auto cRdiv = 12.0f / (a + 1.0f);
+    auto resRdiv = cRdiv.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resRdiv[i, j] == 12.0f / (sa[i, j] + 1.0f));
+
+    // Functions add, sub, mul, div with scalar
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+        {
+            assert(add(a, 2.5f).toNdslice()[i, j] == resAdd[i, j]);
+            assert(sub(10.0f, a).toNdslice()[i, j] == resRsub[i, j]);
+            assert(mul(3.0f, a).toNdslice()[i, j] == resMul[i, j]);
+        }
+}
+
+unittest
+{
+    // Broadcasting
+    // Case 1: [3, 1] + [1, 4] -> [3, 4]
+    auto sa = iota([3, 1], 1).as!float.slice;
+    auto sb = iota([1, 4], 10).as!float.slice;
+
+    auto a = fromNdslice(sa);
+    auto b = fromNdslice(sb);
+
+    auto c = a + b;
+    static assert(is(typeof(c) == Tensor!(float, 2)));
+    assert(c.shape == [3LU, 4LU]);
+    auto res = c.toNdslice();
+    foreach (i; 0 .. 3)
+        foreach (j; 0 .. 4)
+            assert(res[i, j] == sa[i, 0] + sb[0, j]);
+
+    auto cSub = a - b;
+    auto resSub = cSub.toNdslice();
+    foreach (i; 0 .. 3)
+        foreach (j; 0 .. 4)
+            assert(resSub[i, j] == sa[i, 0] - sb[0, j]);
+
+    auto cMul = a * b;
+    auto resMul = cMul.toNdslice();
+    foreach (i; 0 .. 3)
+        foreach (j; 0 .. 4)
+            assert(resMul[i, j] == sa[i, 0] * sb[0, j]);
+
+    // Case 2: [2, 3] + [3] -> [2, 3] (different ranks)
+    auto s23 = iota(2, 3).as!float.slice;
+    auto s3 = iota([3], 100).as!float.slice;
+
+    auto t23 = fromNdslice(s23);
+    auto t3 = fromNdslice(s3);
+
+    auto c23 = t23 + t3;
+    static assert(is(typeof(c23) == Tensor!(float, 2)));
+    assert(c23.shape == [2LU, 3LU]);
+    auto res23 = c23.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(res23[i, j] == s23[i, j] + s3[j]);
+
+    // Right-hand broadcast with different ranks: [3] + [2, 3] -> [2, 3]
+    auto c32 = t3 + t23;
+    auto res32 = c32.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(res32[i, j] == res23[i, j]);
+
+    // Case 3: 1D broadcast [1] + [5] -> [5]
+    auto s1 = iota([1], 5).as!float.slice;
+    auto s5 = iota([5], 1).as!float.slice;
+    auto t1 = fromNdslice(s1);
+    auto t5 = fromNdslice(s5);
+    auto c15 = t1 + t5;
+    static assert(is(typeof(c15) == Tensor!(float, 1)));
+    assert(c15.shape == [5LU]);
+    auto res15 = c15.toNdslice();
+    foreach (i; 0 .. 5)
+        assert(res15[i] == s1[0] + s5[i]);
+}
+
+unittest
+{
+    // Transposed input
+    // [3, 2] transposed to [2, 3] + contiguous [2, 3]
+    auto sa = iota(3, 2).as!float.slice;
+    auto sb = iota([2, 3], 20).as!float.slice;
+
+    auto a = fromNdslice(sa);
+    auto b = fromNdslice(sb);
+
+    auto at = a.transpose();
+    assert(at.shape == [2LU, 3LU]);
+    assert(!at.contiguous);
+
+    auto c = at + b;
+    assert(c.shape == [2LU, 3LU]);
+    auto res = c.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(res[i, j] == sa[j, i] + sb[i, j]);
+
+    // Transposed input with scalar
+    auto cScalar = at * 2.0f;
+    assert(cScalar.shape == [2LU, 3LU]);
+    auto resScalar = cScalar.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resScalar[i, j] == sa[j, i] * 2.0f);
+
+    // Transposed input + broadcast [3]
+    auto s3 = iota([3], 50).as!float.slice;
+    auto t3 = fromNdslice(s3);
+    auto cBc = at + t3;
+    assert(cBc.shape == [2LU, 3LU]);
+    auto resBc = cBc.toNdslice();
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            assert(resBc[i, j] == sa[j, i] + s3[j]);
+}
+
+unittest
+{
+    // Incompatible shapes error
+    import std.exception : assertThrown;
+
+    auto a = Tensor!(float, 2)([2LU, 3LU]);
+    auto b = Tensor!(float, 2)([2LU, 4LU]);
+    auto c = Tensor!(float, 1)([4LU]);
+
+    assertThrown!ShapeMismatchException(a + b);
+    assertThrown!ShapeMismatchException(a - b);
+    assertThrown!ShapeMismatchException(a * c);
+    assertThrown!ShapeMismatchException(a / c);
 }
