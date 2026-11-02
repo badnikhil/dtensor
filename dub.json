@@ -1,0 +1,24 @@
+{
+    "name": "dtensor",
+    "description": "GPU-accelerated tensor programming model for D, built on dcompute",
+    "authors": ["Nikhil Jatt"],
+    "license": "BSL-1.0",
+    "copyright": "Copyright © 2026, Nikhil Jatt",
+
+    "targetType": "library",
+
+    "dependencies": {
+        "dcompute": { "path": "../dcompute" },
+        "mir-algorithm": "~>3.22.4"
+    },
+
+    "toolchainRequirements": {
+        "dmd": "no",
+        "gdc": "no",
+        "ldc": ">=1.43.0"
+    },
+
+    "configurations": [
+        { "name": "library" }
+    ]
+}

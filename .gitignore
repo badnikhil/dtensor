@@ -17,8 +17,10 @@ docs.json
 *.ptx
 *.spv
 *-test-*
-dtensor
-dtensor-*
+/dtensor
+/dtensor-*
+/libdtensor.a
+__dummy_docs/
 
 # agent scratch — local only, never committed
 agent-docs/
