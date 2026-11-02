@@ -9,7 +9,6 @@
 module dtensor.tensor;
 
 import dcompute.driver.cuda;
-import dcompute.driver.cuda.rc;
 import dcompute.driver.cuda.rc : Buffer;
 public import dcompute.std.ndview : NdView;
 import ldc.dcompute : GlobalPointer;
