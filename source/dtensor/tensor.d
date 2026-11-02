@@ -9,6 +9,8 @@
 module dtensor.tensor;
 
 import dcompute.driver.cuda;
+import dcompute.driver.cuda.rc;
+import dcompute.driver.cuda.rc : Buffer;
 public import dcompute.std.ndview : NdView;
 import ldc.dcompute : GlobalPointer;
 
@@ -733,4 +735,160 @@ unittest
     assertThrown!ShapeMismatchException(a - b);
     assertThrown!ShapeMismatchException(a * c);
     assertThrown!ShapeMismatchException(a / c);
+}
+
+unittest
+{
+    // Loop churn test: allocate and free 2000 x 1MB tensors and verify
+    // cuMemGetInfo returns to baseline within a small tolerance.
+    import bindbc.cuda : cuMemGetInfo;
+    import std.stdio : writefln;
+
+    ensureInit();
+
+    // Warm-up allocation to prime CUDA driver memory structures
+    {
+        auto warm = Tensor!(float, 1)([256 * 1024LU]);
+    }
+
+    size_t freeBefore, totalBefore;
+    immutable errBefore = cuMemGetInfo(&freeBefore, &totalBefore);
+    assert(errBefore == 0, "cuMemGetInfo failed before loop");
+
+    enum size_t count = 2000;
+    enum size_t elems = 256 * 1024LU; // 256K * 4B = 1 MiB
+
+    foreach (i; 0 .. count)
+    {
+        auto t = Tensor!(float, 1)([elems]);
+        assert(t.store.raw != 0);
+    }
+
+    size_t freeAfter, totalAfter;
+    immutable errAfter = cuMemGetInfo(&freeAfter, &totalAfter);
+    assert(errAfter == 0, "cuMemGetInfo failed after loop");
+
+    writefln("cuMemGetInfo baseline: %d bytes free (%d MB), after 2000x1MB: %d bytes free (%d MB), delta: %d bytes",
+        freeBefore, freeBefore / (1024 * 1024),
+        freeAfter, freeAfter / (1024 * 1024),
+        cast(long)freeBefore - cast(long)freeAfter);
+
+    // Tolerance of 2 MiB (against 2000 MiB churn)
+    enum size_t tolerance = 2 * 1024 * 1024;
+    immutable long delta = cast(long)freeBefore - cast(long)freeAfter;
+    assert(delta >= -cast(long)tolerance && delta <= cast(long)tolerance,
+        "Device memory leak detected: free memory did not return to baseline");
+}
+
+unittest
+{
+    // View outlives parent test:
+    // Verify that views (transpose, reshape) share ownership of the device buffer,
+    // data remains valid and accessible after the parent is destroyed,
+    // device memory is NOT freed while any view is alive, and IS freed when the last view dies.
+    import bindbc.cuda : cuMemGetInfo;
+    import std.stdio : writefln;
+
+    ensureInit();
+
+    // Warm-up
+    {
+        auto warm = Tensor!(float, 1)([256 * 1024LU]);
+    }
+
+    size_t freeBaseline, totalBaseline;
+    assert(cuMemGetInfo(&freeBaseline, &totalBaseline) == 0);
+
+    enum size_t rows = 1024, cols = 1024; // 1M floats = 4 MiB
+    enum size_t elems = rows * cols;
+    enum size_t bytes = elems * float.sizeof;
+
+    // Part 1: Data correctness when view outlives parent
+    {
+        Tensor!(float, 2) viewTransposed;
+        Tensor!(float, 1) viewReshaped;
+        size_t parentRaw;
+
+        {
+            auto src = iota(3, 4).as!float.slice;
+            auto parent = fromNdslice(src);
+            parentRaw = parent.store.raw;
+            assert(parentRaw != 0);
+
+            viewTransposed = parent.transpose();
+            viewReshaped = parent.reshape([12LU]);
+
+            assert(viewTransposed.store.raw == parentRaw);
+            assert(viewReshaped.store.raw == parentRaw);
+
+            // parent is destroyed here
+        }
+
+        // Parent is dead, views are alive
+        assert(viewTransposed.store.raw == parentRaw);
+        assert(viewReshaped.store.raw == parentRaw);
+
+        auto sliceT = viewTransposed.toNdslice();
+        foreach (i; 0 .. 4)
+            foreach (j; 0 .. 3)
+                assert(sliceT[i, j] == cast(float)(j * 4 + i));
+
+        auto sliceR = viewReshaped.toNdslice();
+        foreach (k; 0 .. 12)
+            assert(sliceR[k] == cast(float) k);
+    }
+
+    // Part 2: Device memory lifetime when view outlives parent
+    {
+        size_t freeBefore;
+        assert(cuMemGetInfo(&freeBefore, &totalBaseline) == 0);
+
+        Tensor!(float, 2) viewTransposed;
+        Tensor!(float, 1) viewReshaped;
+        size_t parentRaw;
+
+        {
+            auto parent = Tensor!(float, 2)([rows, cols]);
+            parentRaw = parent.store.raw;
+            assert(parentRaw != 0);
+
+            size_t freeWithParent;
+            assert(cuMemGetInfo(&freeWithParent, &totalBaseline) == 0);
+            assert(freeBefore >= freeWithParent + bytes, "Parent device memory was not allocated");
+
+            viewTransposed = parent.transpose();
+            viewReshaped = parent.reshape([elems]);
+
+            assert(viewTransposed.store.raw == parentRaw);
+            assert(viewReshaped.store.raw == parentRaw);
+
+            // parent is destroyed here
+        }
+
+        // Parent is destroyed, but viewTransposed and viewReshaped still hold ownership
+        size_t freeWithViews;
+        assert(cuMemGetInfo(&freeWithViews, &totalBaseline) == 0);
+        assert(freeBefore >= freeWithViews + bytes, "Device memory freed prematurely while views alive");
+        assert(viewTransposed.store.raw == parentRaw);
+        assert(viewReshaped.store.raw == parentRaw);
+
+        // Destroy one view
+        viewReshaped = Tensor!(float, 1).init;
+        size_t freeWithOneView;
+        assert(cuMemGetInfo(&freeWithOneView, &totalBaseline) == 0);
+        assert(freeBefore >= freeWithOneView + bytes, "Device memory freed while last view alive");
+
+        // Destroy final view
+        viewTransposed = Tensor!(float, 2).init;
+        size_t freeAfterViews;
+        assert(cuMemGetInfo(&freeAfterViews, &totalBaseline) == 0);
+
+        enum size_t tolerance = 1024 * 1024; // 1 MiB tolerance
+        immutable long diff = cast(long)freeBefore - cast(long)freeAfterViews;
+        assert(diff >= -cast(long)tolerance && diff <= cast(long)tolerance,
+            "Device memory was not freed after all views died");
+
+        writefln("View-outlives-parent memory: baseline=%d bytes, with-views=%d bytes, after-views=%d bytes",
+            freeBefore, freeWithViews, freeAfterViews);
+    }
 }
