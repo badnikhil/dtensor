@@ -28,17 +28,17 @@ void main()
 
 ## Running Tests
 
-Run the test suite with LDC in PATH:
+Run the test suite (LDC 1.43.0+ must be the `ldc2` on PATH, or pass `--compiler=ldc2`):
 
 ```sh
-PATH=/home/nikhil/dlang/ldc-1.43.0/bin:$PATH nice -n 19 ionice -c3 dub test --force
+dub test --force
 ```
 
 An executable broadcasting example is available under `examples/elementwise/` and can be run with:
 
 ```sh
 cd examples/elementwise
-PATH=/home/nikhil/dlang/ldc-1.43.0/bin:$PATH nice -n 19 ionice -c3 dub run
+dub run
 ```
 
 ## License
