@@ -256,7 +256,7 @@ if (N >= 1)
     Tensor!(T, (N >= Nb ? N : Nb)) opBinary(string op, size_t Nb)(auto ref const Tensor!(T, Nb) rhs) const
     if (op == "+" || op == "-" || op == "*" || op == "/")
     {
-        import dtensor.testkernels : elementwiseOp;
+        import dtensor.kernels : elementwiseOp;
 
         enum size_t OutRank = N >= Nb ? N : Nb;
         const size_t[OutRank] outShape = broadcastShapes!(N, Nb)(this.shape, rhs.shape);
@@ -281,7 +281,7 @@ if (N >= 1)
         !isTensor!S &&
         (is(S : T) || is(typeof(cast(T) rhs))))
     {
-        import dtensor.testkernels : elementwiseOp;
+        import dtensor.kernels : elementwiseOp;
 
         auto res = Tensor!(T, N)(this.shape);
         auto vA = this.deviceView();
@@ -302,7 +302,7 @@ if (N >= 1)
         !isTensor!S &&
         (is(S : T) || is(typeof(cast(T) lhs))))
     {
-        import dtensor.testkernels : elementwiseOp;
+        import dtensor.kernels : elementwiseOp;
 
         auto res = Tensor!(T, N)(this.shape);
         auto vB = this.deviceView();
