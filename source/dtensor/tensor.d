@@ -139,6 +139,18 @@ unittest
     assertThrown!ShapeMismatchException(broadcastShapes([2LU, 3LU], [4LU]));
 }
 
+/// Helper to launch a kernel with dynamic shared memory.
+private void launchKernel(alias k, Args...)(uint[3] grid, uint[3] block, uint sharedMem, Args args)
+{
+    if (Program.globalProgram.raw is null)
+    {
+        import std.traits : moduleName;
+        ensureInit();
+        Program.globalProgram = Program.fromModule!(moduleName!(__traits(parent, k)))();
+    }
+    defaultQueue().enqueue!k(grid, block, sharedMem)(args);
+}
+
 /// An N-dimensional tensor whose elements live in device memory.
 struct Tensor(T, size_t N)
 if (N >= 1)
@@ -317,6 +329,201 @@ if (N >= 1)
 
         return res;
     }
+
+    private T reduceFullImpl(string op)() const
+    {
+        import dtensor.kernels : reduceBlock;
+
+        assert(this.length > 0, "cannot reduce empty tensor");
+
+        enum uint BLOCK_SIZE = 256;
+        uint grid = cast(uint)((this.length + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        if (grid == 0) grid = 1;
+
+        auto partial = Tensor!(T, 1)([grid]);
+        alias K1 = reduceBlock!(op, T, N);
+        launchKernel!K1([grid, 1, 1], [BLOCK_SIZE, 1, 1], cast(uint)(BLOCK_SIZE * T.sizeof),
+                        partial.deviceView(), this.deviceView());
+
+        size_t currentLen = grid;
+        auto currentTensor = partial;
+
+        while (currentLen > 1)
+        {
+            uint nextGrid = cast(uint)((currentLen + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            if (nextGrid == 0) nextGrid = 1;
+
+            auto nextTensor = Tensor!(T, 1)([nextGrid]);
+            alias K2 = reduceBlock!(op, T, 1);
+            launchKernel!K2([nextGrid, 1, 1], [BLOCK_SIZE, 1, 1], cast(uint)(BLOCK_SIZE * T.sizeof),
+                            nextTensor.deviceView(), currentTensor.deviceView());
+
+            currentTensor = nextTensor;
+            currentLen = nextGrid;
+        }
+
+        return currentTensor.toNdslice()[0];
+    }
+
+    private Tensor!(T, N - 1) reduceAxisImpl(string op)(size_t axis) const
+    if (N > 1)
+    {
+        import dtensor.kernels : reduceAxis;
+
+        assert(axis < N, "axis out of bounds");
+        assert(this.shape[axis] > 0, "cannot reduce along zero-sized axis");
+
+        size_t[N - 1] outShape;
+        size_t j = 0;
+        foreach (d; 0 .. N)
+        {
+            if (d != axis)
+                outShape[j++] = this.shape[d];
+        }
+
+        auto res = Tensor!(T, N - 1)(outShape);
+
+        enum uint block = 256;
+        uint grid = cast(uint)((res.length + block - 1) / block);
+        if (grid == 0) grid = 1;
+
+        alias K = reduceAxis!(op, T, N, N - 1);
+        launch!K([grid, 1, 1], [block, 1, 1], res.deviceView(), this.deviceView(), axis);
+
+        return res;
+    }
+
+    /// Full reduction: sum of all elements.
+    T sum() const
+    {
+        return reduceFullImpl!"sum"();
+    }
+
+    /// Full reduction: maximum of all elements.
+    T max() const
+    {
+        return reduceFullImpl!"max"();
+    }
+
+    /// Full reduction: minimum of all elements.
+    T min() const
+    {
+        return reduceFullImpl!"min"();
+    }
+
+    /// Full reduction: arithmetic mean of all elements.
+    /// For integer tensors, computes integer division `sum / count`.
+    T mean() const
+    {
+        assert(this.length > 0, "cannot compute mean of empty tensor");
+        return cast(T)(this.sum() / cast(T) this.length);
+    }
+
+    static if (N > 1)
+    {
+        /// Sum reduction along `axis`, returning a tensor of rank N-1.
+        Tensor!(T, N - 1) sum(size_t axis) const
+        {
+            return reduceAxisImpl!"sum"(axis);
+        }
+
+        /// Maximum reduction along `axis`, returning a tensor of rank N-1.
+        Tensor!(T, N - 1) max(size_t axis) const
+        {
+            return reduceAxisImpl!"max"(axis);
+        }
+
+        /// Minimum reduction along `axis`, returning a tensor of rank N-1.
+        Tensor!(T, N - 1) min(size_t axis) const
+        {
+            return reduceAxisImpl!"min"(axis);
+        }
+
+        /// Arithmetic mean reduction along `axis`, returning a tensor of rank N-1.
+        /// For integer tensors, computes integer division along the axis.
+        Tensor!(T, N - 1) mean(size_t axis) const
+        {
+            return reduceAxisImpl!"mean"(axis);
+        }
+    }
+    else static if (N == 1)
+    {
+        /// Reduction of a 1-D tensor along its single axis (0) returns a scalar.
+        T sum(size_t axis) const
+        {
+            assert(axis == 0, "axis out of bounds for 1-D tensor");
+            return this.sum();
+        }
+
+        /// Reduction of a 1-D tensor along its single axis (0) returns a scalar.
+        T max(size_t axis) const
+        {
+            assert(axis == 0, "axis out of bounds for 1-D tensor");
+            return this.max();
+        }
+
+        /// Reduction of a 1-D tensor along its single axis (0) returns a scalar.
+        T min(size_t axis) const
+        {
+            assert(axis == 0, "axis out of bounds for 1-D tensor");
+            return this.min();
+        }
+
+        /// Reduction of a 1-D tensor along its single axis (0) returns a scalar.
+        T mean(size_t axis) const
+        {
+            assert(axis == 0, "axis out of bounds for 1-D tensor");
+            return this.mean();
+        }
+    }
+}
+
+/// Full sum reduction: `sum(tensor)`.
+auto sum(T, size_t N)(auto ref const Tensor!(T, N) t)
+{
+    return t.sum();
+}
+
+/// Sum reduction along `axis`: `sum(tensor, axis)`.
+auto sum(T, size_t N)(auto ref const Tensor!(T, N) t, size_t axis)
+{
+    return t.sum(axis);
+}
+
+/// Full max reduction: `max(tensor)`.
+auto max(T, size_t N)(auto ref const Tensor!(T, N) t)
+{
+    return t.max();
+}
+
+/// Max reduction along `axis`: `max(tensor, axis)`.
+auto max(T, size_t N)(auto ref const Tensor!(T, N) t, size_t axis)
+{
+    return t.max(axis);
+}
+
+/// Full min reduction: `min(tensor)`.
+auto min(T, size_t N)(auto ref const Tensor!(T, N) t)
+{
+    return t.min();
+}
+
+/// Min reduction along `axis`: `min(tensor, axis)`.
+auto min(T, size_t N)(auto ref const Tensor!(T, N) t, size_t axis)
+{
+    return t.min(axis);
+}
+
+/// Full mean reduction: `mean(tensor)`.
+auto mean(T, size_t N)(auto ref const Tensor!(T, N) t)
+{
+    return t.mean();
+}
+
+/// Mean reduction along `axis`: `mean(tensor, axis)`.
+auto mean(T, size_t N)(auto ref const Tensor!(T, N) t, size_t axis)
+{
+    return t.mean(axis);
 }
 
 /// Elementwise addition: `a + b`.
@@ -890,4 +1097,258 @@ unittest
         writefln("View-outlives-parent memory: baseline=%d bytes, with-views=%d bytes, after-views=%d bytes",
             freeBefore, freeWithViews, freeAfterViews);
     }
+}
+
+unittest
+{
+    // Full reductions on large non-power-of-2 1-D tensor (> 1 block: 1_000_003 elements)
+    import mir.ndslice.topology : iota, map, flattened;
+    import mir.ndslice.allocation : slice;
+    import mir.math.sum : sum;
+    import mir.math.stat : mean;
+    import mir.algorithm.iteration : reduce;
+    import std.math : isClose, abs;
+
+    ensureInit();
+
+    enum size_t N = 1_000_003;
+    // Values alternating or scaled so sum doesn't overflow float
+    auto host = new float[N];
+    foreach (i; 0 .. N)
+        host[i] = ((i % 100) - 50) * 0.1f;
+
+    auto hostSlice = host.sliced;
+    auto t = fromNdslice(hostSlice);
+
+    float expSum = hostSlice.sum;
+    float expMean = hostSlice.mean;
+    float expMax = reduce!"a > b ? a : b"(-float.infinity, hostSlice);
+    float expMin = reduce!"a < b ? a : b"(float.infinity, hostSlice);
+
+    float devSum = t.sum();
+    float devMean = t.mean();
+    float devMax = t.max();
+    float devMin = t.min();
+
+    // Verify float tolerance (tree reduce rounding vs host summation)
+    assert(isClose(devSum, expSum, 1e-4, 1e-4), "1_000_003 sum mismatch");
+    assert(isClose(devMean, expMean, 1e-4, 1e-4), "1_000_003 mean mismatch");
+    assert(devMax == expMax, "1_000_003 max mismatch");
+    assert(devMin == expMin, "1_000_003 min mismatch");
+
+    // Also test free functions
+    assert(isClose(dtensor.tensor.sum(t), expSum, 1e-4, 1e-4));
+    assert(isClose(dtensor.tensor.mean(t), expMean, 1e-4, 1e-4));
+    assert(dtensor.tensor.max(t) == expMax);
+    assert(dtensor.tensor.min(t) == expMin);
+
+    // Rank-1 axis reduction returns scalar
+    assert(isClose(t.sum(0), expSum, 1e-4, 1e-4));
+    assert(isClose(t.mean(0), expMean, 1e-4, 1e-4));
+    assert(t.max(0) == expMax);
+    assert(t.min(0) == expMin);
+}
+
+unittest
+{
+    // Reductions along each axis of a 3-D tensor (sum, max, min, mean)
+    import mir.ndslice.topology : iota, alongDim, map, as;
+    import mir.ndslice.allocation : slice;
+    import mir.math.sum : sum;
+    import mir.math.stat : mean;
+    import mir.algorithm.iteration : reduce;
+    import std.math : isClose;
+
+    ensureInit();
+
+    // Shape [3, 5, 7] - non-power-of-2 dimensions
+    auto hostFloat = iota(3, 5, 7).as!float.slice;
+    auto tFloat = fromNdslice(hostFloat);
+
+    // Axis 0
+    {
+        auto expSum = hostFloat.alongDim!0.map!sum.slice;
+        auto expMean = hostFloat.alongDim!0.map!mean.slice;
+        auto expMax = hostFloat.alongDim!0.map!(s => reduce!"a > b ? a : b"(-float.infinity, s)).slice;
+        auto expMin = hostFloat.alongDim!0.map!(s => reduce!"a < b ? a : b"(float.infinity, s)).slice;
+
+        auto devSum = tFloat.sum(0).toNdslice();
+        auto devMean = tFloat.mean(0).toNdslice();
+        auto devMax = tFloat.max(0).toNdslice();
+        auto devMin = tFloat.min(0).toNdslice();
+
+        assert(devSum.shape == [5LU, 7LU]);
+        foreach (i; 0 .. 5)
+            foreach (j; 0 .. 7)
+            {
+                assert(isClose(devSum[i, j], expSum[i, j], 1e-5, 1e-5));
+                assert(isClose(devMean[i, j], expMean[i, j], 1e-5, 1e-5));
+                assert(devMax[i, j] == expMax[i, j]);
+                assert(devMin[i, j] == expMin[i, j]);
+            }
+    }
+
+    // Axis 1
+    {
+        auto expSum = hostFloat.alongDim!1.map!sum.slice;
+        auto expMean = hostFloat.alongDim!1.map!mean.slice;
+        auto expMax = hostFloat.alongDim!1.map!(s => reduce!"a > b ? a : b"(-float.infinity, s)).slice;
+        auto expMin = hostFloat.alongDim!1.map!(s => reduce!"a < b ? a : b"(float.infinity, s)).slice;
+
+        auto devSum = tFloat.sum(1).toNdslice();
+        auto devMean = tFloat.mean(1).toNdslice();
+        auto devMax = tFloat.max(1).toNdslice();
+        auto devMin = tFloat.min(1).toNdslice();
+
+        assert(devSum.shape == [3LU, 7LU]);
+        foreach (i; 0 .. 3)
+            foreach (j; 0 .. 7)
+            {
+                assert(isClose(devSum[i, j], expSum[i, j], 1e-5, 1e-5));
+                assert(isClose(devMean[i, j], expMean[i, j], 1e-5, 1e-5));
+                assert(devMax[i, j] == expMax[i, j]);
+                assert(devMin[i, j] == expMin[i, j]);
+            }
+    }
+
+    // Axis 2
+    {
+        auto expSum = hostFloat.alongDim!2.map!sum.slice;
+        auto expMean = hostFloat.alongDim!2.map!mean.slice;
+        auto expMax = hostFloat.alongDim!2.map!(s => reduce!"a > b ? a : b"(-float.infinity, s)).slice;
+        auto expMin = hostFloat.alongDim!2.map!(s => reduce!"a < b ? a : b"(float.infinity, s)).slice;
+
+        auto devSum = tFloat.sum(2).toNdslice();
+        auto devMean = tFloat.mean(2).toNdslice();
+        auto devMax = tFloat.max(2).toNdslice();
+        auto devMin = tFloat.min(2).toNdslice();
+
+        assert(devSum.shape == [3LU, 5LU]);
+        foreach (i; 0 .. 3)
+            foreach (j; 0 .. 5)
+            {
+                assert(isClose(devSum[i, j], expSum[i, j], 1e-5, 1e-5));
+                assert(isClose(devMean[i, j], expMean[i, j], 1e-5, 1e-5));
+                assert(devMax[i, j] == expMax[i, j]);
+                assert(devMin[i, j] == expMin[i, j]);
+            }
+    }
+}
+
+unittest
+{
+    // Transposed inputs: non-contiguous layout reductions
+    import mir.ndslice.topology : iota, alongDim, map, as;
+    import mir.ndslice.dynamic : transposed;
+    import mir.ndslice.allocation : slice;
+    import mir.math.sum : sum;
+    import mir.math.stat : mean;
+    import mir.algorithm.iteration : reduce;
+    import std.math : isClose;
+
+    ensureInit();
+
+    // 2-D transposed [3, 4] -> [4, 3]
+    auto host2D = iota(3, 4).as!double.slice;
+    auto t2D = fromNdslice(host2D);
+    auto t2DT = t2D.transpose();
+    assert(!t2DT.contiguous);
+
+    auto host2DT = host2D.transposed;
+
+    // Full reductions on transposed 2-D
+    assert(isClose(t2DT.sum(), host2DT.sum, 1e-9, 1e-9));
+    assert(isClose(t2DT.mean(), host2DT.mean, 1e-9, 1e-9));
+    assert(t2DT.max() == reduce!"a > b ? a : b"(-double.infinity, host2DT));
+    assert(t2DT.min() == reduce!"a < b ? a : b"(double.infinity, host2DT));
+
+    // Axis reductions on transposed 2-D
+    auto devSum0 = t2DT.sum(0).toNdslice();
+    auto expSum0 = host2DT.alongDim!0.map!sum.slice;
+    foreach (j; 0 .. 3)
+        assert(isClose(devSum0[j], expSum0[j], 1e-9, 1e-9));
+
+    auto devSum1 = t2DT.sum(1).toNdslice();
+    auto expSum1 = host2DT.alongDim!1.map!sum.slice;
+    foreach (i; 0 .. 4)
+        assert(isClose(devSum1[i], expSum1[i], 1e-9, 1e-9));
+
+    // 3-D transposed [2, 3, 4] with permutation [2, 0, 1] -> [4, 2, 3]
+    auto host3D = iota(2, 3, 4).as!float.slice;
+    auto t3D = fromNdslice(host3D);
+    auto t3DT = t3D.transpose([2LU, 0LU, 1LU]);
+    assert(!t3DT.contiguous);
+    auto host3DT = host3D.transposed!(2, 0, 1);
+
+    auto devMaxAxis1 = t3DT.max(1).toNdslice();
+    auto expMaxAxis1 = host3DT.alongDim!1.map!(s => reduce!"a > b ? a : b"(-float.infinity, s)).slice;
+    assert(devMaxAxis1.shape == [4LU, 3LU]);
+    foreach (i; 0 .. 4)
+        foreach (j; 0 .. 3)
+            assert(devMaxAxis1[i, j] == expMaxAxis1[i, j]);
+}
+
+unittest
+{
+    // Integer reductions: int types, negative numbers, integer division for mean
+    import mir.ndslice.topology : iota, alongDim, map, as;
+    import mir.ndslice.allocation : slice;
+    import mir.math.sum : sum;
+    import mir.algorithm.iteration : reduce;
+
+    ensureInit();
+
+    // Negative and positive ints: [-15 .. 14] in [5, 6]
+    auto hostInt = iota([5, 6], -15).as!int.slice;
+    auto tInt = fromNdslice(hostInt);
+
+    int expSum = cast(int) hostInt.sum;
+    int expMax = reduce!"a > b ? a : b"(int.min, hostInt);
+    int expMin = reduce!"a < b ? a : b"(int.max, hostInt);
+    int expMean = expSum / 30; // documented integer division
+
+    assert(tInt.sum() == expSum);
+    assert(tInt.max() == expMax);
+    assert(tInt.min() == expMin);
+    assert(tInt.mean() == expMean);
+
+    // Axis 1 integer mean
+    auto devMeanAxis1 = tInt.mean(1).toNdslice();
+    auto expSumAxis1 = hostInt.alongDim!1.map!sum.slice;
+    foreach (i; 0 .. 5)
+    {
+        int rowMean = cast(int)(expSumAxis1[i] / 6);
+        assert(devMeanAxis1[i] == rowMean);
+    }
+}
+
+unittest
+{
+    // Double precision and 4-D tensor reduction
+    import mir.ndslice.topology : iota, alongDim, map, as;
+    import mir.ndslice.allocation : slice;
+    import mir.math.sum : sum;
+    import mir.math.stat : mean;
+    import std.math : isClose;
+
+    ensureInit();
+
+    // 4-D tensor shape [2, 3, 2, 4] = 48 doubles
+    auto host4D = iota(2, 3, 2, 4).as!double.slice;
+    auto t4D = fromNdslice(host4D);
+
+    // Full reduction on 4-D double
+    assert(isClose(t4D.sum(), host4D.sum, 1e-12, 1e-12));
+    assert(isClose(t4D.mean(), host4D.mean, 1e-12, 1e-12));
+    assert(t4D.max() == 47.0);
+    assert(t4D.min() == 0.0);
+
+    // Axis 2 reduction on 4-D double -> 3-D tensor shape [2, 3, 4]
+    auto devSumAxis2 = t4D.sum(2).toNdslice();
+    auto expSumAxis2 = host4D.alongDim!2.map!sum.slice;
+    assert(devSumAxis2.shape == [2LU, 3LU, 4LU]);
+    foreach (i; 0 .. 2)
+        foreach (j; 0 .. 3)
+            foreach (k; 0 .. 4)
+                assert(isClose(devSumAxis2[i, j, k], expSumAxis2[i, j, k], 1e-12, 1e-12));
 }
