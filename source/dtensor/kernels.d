@@ -18,11 +18,15 @@ pragma(LDC_inline_ir)
 /// Returns a pointer to dynamic shared memory at offset 0.
 T* getSharedBase(T)()
 {
-    return inlineIR!(`
-        %gen = call i64 asm "cvta.shared.u64 $0, $1;", "=l,l"(i64 0)
-        %ptr = inttoptr i64 %gen to ptr
-        ret ptr %ptr
-    `, T*)();
+    if (__dcompute_reflect(ReflectTarget.CUDA))
+    {
+        return inlineIR!(`
+            %gen = call i64 asm "cvta.shared.u64 $0, $1;", "=l,l"(i64 0)
+            %ptr = inttoptr i64 %gen to ptr
+            ret ptr %ptr
+        `, T*)();
+    }
+    assert(0);
 }
 
 /// Identity value for tree reduction out-of-bounds padding.
