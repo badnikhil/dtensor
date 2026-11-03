@@ -15,4 +15,9 @@ void main()
     writeln("b shape: ", b.shape);
     writeln("c shape: ", c.shape);
     writeln("c = a + b:\n", c.toNdslice());
+
+    auto total = c.sum();
+    auto colMeans = c.mean(0);
+    writeln("c.sum(): ", total);
+    writeln("c.mean(0):\n", colMeans.toNdslice());
 }
