@@ -23,6 +23,10 @@ void main()
 
     auto c = a + b;
     writeln("Result:\n", c.toNdslice());
+
+    // Reductions: full sum and mean along axis 0
+    writeln("Total sum: ", c.sum());
+    writeln("Column means:\n", c.mean(0).toNdslice());
 }
 ```
 
